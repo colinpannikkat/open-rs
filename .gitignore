@@ -175,5 +175,9 @@ cython_debug/
 
 # Ignore local files
 notebooks/
-data/
+/data/
 sh/
+
+.triton
+wandb
+~
