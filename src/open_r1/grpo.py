@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
+from typing import Optional, Literal
 
 import datasets
 import torch
@@ -23,6 +24,7 @@ import transformers
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
+from transformers.utils import is_peft_available
 
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
@@ -39,11 +41,75 @@ from open_r1.rewards import (
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
-from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
+from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser
 
+if is_peft_available():
+    from peft import LoraConfig, PeftConfig, LoftQConfig
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class LoRAModelConfig(ModelConfig):
+    lora_use_loftq : bool = field(
+        default=False,
+        metadata={"help": "Whether to utilize LoftQ for LoRA initialization."}
+    )
+    init_lora_weights: (  # Literally just ripped this from LoraConfig
+        Literal["default", "gaussian", "eva", "olora", "pissa", "pissa_niter_[number of iters]", "corda", "loftq"]
+    ) = field(
+        default=None,
+        metadata={
+            "help": (
+                "How to initialize the weights of the LoRA layers. "
+                "Passing 'default' (default) results in the default initialization from the reference implementation from "
+                "Microsoft, with the LoRA B weight being set to 0. This means that without further training, the LoRA "
+                "adapter will be a no-op. "
+                "Setting the initialization to False leads to random initialization of LoRA A and B, meaning that LoRA "
+                "is not a no-op before training; this setting is intended for debugging purposes. "
+                "Passing `'gaussian'` results in Gaussian initialization scaled by the LoRA rank for linear and layers. "
+                "Passing `'eva'` results in a data-driven initialization of Explained Variance Adaptation. "
+                "Passing `'olora'` results in OLoRA initialization. "
+                "Passing `'pissa'` results in PiSSA initialization. "
+                "Passing `'pissa_niter_[number of iters]'` initiates Fast-SVD-based PiSSA initialization, where "
+                "[number of iters] indicates the number of subspace iterations to perform fsvd, and must be a "
+                "nonnegative integer. "
+                "Passing `'corda'` results in CorDA initialization. "
+                "Pass `'loftq'` to use LoftQ initialization."
+            ),
+        },
+    )
+
+def get_peft_config(model_args: LoRAModelConfig) -> "Optional[PeftConfig]":
+    """ Overwritten get_peft_config function to enable LoftQConfig loading.
+    
+    """
+    if model_args.use_peft is False:
+        return None
+
+    if not is_peft_available():
+        raise ValueError(
+            "You need to have PEFT library installed in your environment, make sure to install `peft`. "
+            "Make sure to run `pip install -U peft`."
+        )
+    
+    loftq_config = None
+    if model_args.lora_use_loftq:
+        loftq_config = LoftQConfig(loftq_bits=4)
+
+    peft_config = LoraConfig(
+        task_type=model_args.lora_task_type,
+        r=model_args.lora_r,
+        target_modules=model_args.lora_target_modules,
+        lora_alpha=model_args.lora_alpha,
+        lora_dropout=model_args.lora_dropout,
+        bias="none",
+        use_rslora=model_args.use_rslora,
+        modules_to_save=model_args.lora_modules_to_save,
+        loftq_config=loftq_config,
+        init_lora_weights=True if model_args.init_lora_weights == "default" else model_args.init_lora_weights
+    )
+
+    return peft_config
 
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -275,6 +341,6 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
-    parser = TrlParser((GRPOScriptArguments, GRPOConfig, ModelConfig))
+    parser = TrlParser((GRPOScriptArguments, GRPOConfig, LoRAModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
