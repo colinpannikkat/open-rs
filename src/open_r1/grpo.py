@@ -42,6 +42,7 @@ from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser
+from open_r1.grpo_trainer import GRPOTrainerImprovedKL
 
 if is_peft_available():
     from peft import LoraConfig, PeftConfig, LoftQConfig
@@ -277,7 +278,7 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
+    trainer = GRPOTrainerImprovedKL(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
