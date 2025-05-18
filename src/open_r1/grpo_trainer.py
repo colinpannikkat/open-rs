@@ -75,7 +75,6 @@ class GRPOTrainerImprovedKL(GRPOTrainer):
         prompt_inputs = self.processing_class(
             prompts_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False
         )
-        # prompt_inputs = super()._prepare_inputs(prompt_inputs)
         prompt_inputs = HfTrainer._prepare_inputs(self, prompt_inputs)
         prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
@@ -138,27 +137,12 @@ class GRPOTrainerImprovedKL(GRPOTrainer):
             if self.ref_model is not None:
                 logits_full_q = self._get_per_token_logits(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep)
-                # logits_full_q = self.ref_model(input_ids=prompt_completion_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep).logits
             else:
                 # disable adapter if using PEFT
                 with self.accelerator.unwrap_model(self.model).disable_adapter():
                     logits_full_q = self._get_per_token_logits(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
-                    # logits_full_q = self.model(input_ids=prompt_completion_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep).logits
-        # logits_full_q = logits_full_q[:, :-1, :]
-        # logits_full_q = logits_full_q[:, -logits_to_keep:, :]
-
-        # with torch.inference_mode():
-        #     if self.ref_model is not None:
-        #         ref_per_token_logps = self._get_per_token_logps(
-        #             self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
-        #         )
-        #     else:
-        #         with self.accelerator.unwrap_model(self.model).disable_adapter():
-        #             ref_per_token_logps = self._get_per_token_logps(
-        #                 self.model, prompt_completion_ids, attention_mask, logits_to_keep
-        #             )
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
