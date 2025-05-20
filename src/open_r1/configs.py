@@ -50,6 +50,10 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The project to store runs under.")},
     )
+    use_rb_kl_trainer: bool = field(
+        default=False,
+        metadata={"help": "The option on whether to use GRPOTrainerRBKL or the standard GRPOTrainer."},
+    )
 
 
 @dataclass

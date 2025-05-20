@@ -59,7 +59,7 @@ if is_vllm_available():
 if is_wandb_available():
     import wandb
 
-class GRPOTrainerImprovedKL(GRPOTrainer):
+class GRPOTrainerRBKL(GRPOTrainer):
 
     def _get_per_token_logits(self, model, input_ids, attention_mask, logits_to_keep):
         # Get the logits for the completion tokens
