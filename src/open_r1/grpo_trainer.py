@@ -167,7 +167,7 @@ class GRPOTrainerRBKL(GRPOTrainer):
                 reward_inputs = reward_processing_class(
                     texts, return_tensors="pt", padding=True, padding_side="right", add_special_tokens=False
                 )
-                reward_inputs = super()._prepare_inputs(reward_inputs)
+                reward_inputs = HfTrainer._prepare_inputs(self, reward_inputs)
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             else:
@@ -275,7 +275,10 @@ class GRPOTrainerRBKL(GRPOTrainer):
 
         # x - x.detach() allows for preserving gradients from x
         advantages = inputs["advantages"]
+
         per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
+        self._metrics["surrogate_loss"].append(((-per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean().item())
+
         per_token_loss = -(per_token_loss - self.beta * per_step_kl)
         loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
