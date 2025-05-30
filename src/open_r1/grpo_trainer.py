@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
 import os
 import textwrap
 import warnings
@@ -42,33 +43,54 @@ from transformers.integrations.deepspeed import is_deepspeed_zero3_enabled
 from transformers.utils import is_peft_available
 
 from trl.data_utils import apply_chat_template, is_conversational, maybe_apply_chat_template
-from trl.import_utils import is_vllm_available
+from trl.extras.profiling import profiling_decorator
+from trl.import_utils import is_rich_available, is_vllm_available
 from trl.models import create_reference_model, prepare_deepspeed, unwrap_model_for_generation
 from trl.trainer.callbacks import SyncRefModelCallback
 from trl.trainer.grpo_config import GRPOConfig
-from trl.trainer.utils import generate_model_card, get_comet_experiment_url, pad, selective_log_softmax
+from trl.trainer.utils import (
+    generate_model_card,
+    get_comet_experiment_url,
+    pad,
+    print_prompt_completions_sample,
+    selective_log_softmax,
+)
 from trl import GRPOTrainer
 from transformers import Trainer as HfTrainer
+
 
 if is_peft_available():
     from peft import PeftConfig, get_peft_model
 
 if is_vllm_available():
     from vllm import LLM, SamplingParams
+    from vllm.sampling_params import GuidedDecodingParams
 
 if is_wandb_available():
     import wandb
 
-class GRPOTrainerRBKL(GRPOTrainer):
+import logging
+logger = logging.getLogger(__name__)
 
+class GRPOTrainerRBKL(GRPOTrainer):
     def _get_per_token_logits(self, model, input_ids, attention_mask, logits_to_keep):
         # Get the logits for the completion tokens
         logits_full = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
         logits_full = logits_full[:, :-1, :]
         logits_full = logits_full[:, -logits_to_keep:, :]  # (batch, comp_len, vocab)
         return logits_full
+    
+    def compute_kl(self, new_logprobs, ref_logprobs, logits_p=None, logits_q=None):
+        if logits_p is not None:
+            logp = torch.log_softmax(logits_p, dim=-1)
+            logq = torch.log_softmax(logits_q, dim=-1)
 
-    def _prepare_inputs(self, inputs: dict[str, Union[torch.Tensor, Any]]) -> dict[str, Union[torch.Tensor, Any]]:
+            return torch.sum(torch.exp(logp) * (logp - logq), dim=-1)
+        return new_logprobs - ref_logprobs
+
+    def _generate_and_score_completions(
+        self, inputs: dict[str, Union[torch.Tensor, Any]]
+    ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
         prompts = [x["prompt"] for x in inputs]
         prompts_text = [maybe_apply_chat_template(example, self.processing_class)["prompt"] for example in inputs]
@@ -92,8 +114,17 @@ class GRPOTrainerRBKL(GRPOTrainer):
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
             all_prompts_text = gather_object(prompts_text)
             if self.accelerator.is_main_process:
-                outputs = self.llm.generate(all_prompts_text, sampling_params=self.sampling_params, use_tqdm=False)
-                completion_ids = [out.token_ids for completions in outputs for out in completions.outputs]
+                # Since 'prompts' contains 'num_generations' duplicates, we first take unique prompts, and generate
+                # num_generations outputs for each one. This is faster than generating outputs for each duplicate
+                # prompt individually.
+                ordered_set_of_prompts = list(dict.fromkeys(all_prompts_text))
+                all_outputs = self.llm.generate(
+                    ordered_set_of_prompts, sampling_params=self.sampling_params, use_tqdm=False
+                )
+                completion_ids = []
+                for outputs in all_outputs:
+                    for output in outputs.outputs:
+                        completion_ids.append(output.token_ids)
             else:
                 completion_ids = [None] * len(all_prompts_text)
             # Broadcast the completions from the main process to all processes, ensuring each process receives its
@@ -129,12 +160,23 @@ class GRPOTrainerRBKL(GRPOTrainer):
         completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
         # Concatenate prompt_mask with completion_mask for logit computation
-        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
+        attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
 
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
+
         with torch.inference_mode():
-            # Get reference logits: either from self.ref_model or from disabling adapter
-            if self.ref_model is not None:
+            # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's
+            # computation here, and use per_token_logps.detach() instead.
+            if self.num_iterations > 1:
+                old_per_token_logps = self._get_per_token_logps(
+                    self.model, prompt_completion_ids, attention_mask, logits_to_keep
+                )
+            else:
+                old_per_token_logps = None
+
+            if self.beta == 0.0:
+                ref_per_token_logps = None            
+            elif self.ref_model is not None:
                 logits_full_q = self._get_per_token_logits(
                     self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep)
             else:
@@ -143,6 +185,15 @@ class GRPOTrainerRBKL(GRPOTrainer):
                     logits_full_q = self._get_per_token_logits(
                         self.model, prompt_completion_ids, attention_mask, logits_to_keep
                     )
+            # elif self.ref_model is not None:
+            #     ref_per_token_logps = self._get_per_token_logps(
+            #         self.ref_model, prompt_completion_ids, attention_mask, logits_to_keep
+            #     )
+            # else:
+            #     with self.accelerator.unwrap_model(self.model).disable_adapter():
+            #         ref_per_token_logps = self._get_per_token_logps(
+            #             self.model, prompt_completion_ids, attention_mask, logits_to_keep
+            #         )
 
         # Decode the generated completions
         completions_text = self.processing_class.batch_decode(completion_ids, skip_special_tokens=True)
@@ -201,92 +252,118 @@ class GRPOTrainerRBKL(GRPOTrainer):
         advantages = advantages[process_slice]
 
         # Log the metrics
+        mode = "eval" if self.control.should_evaluate else "train"
+
+        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
+        self._metrics[mode]["completion_length"].append(completion_length)
+
         reward_per_func = rewards_per_func.mean(0)
         for i, reward_func in enumerate(self.reward_funcs):
             if isinstance(reward_func, nn.Module):  # Module instead of PretrainedModel for compat with compiled models
                 reward_func_name = reward_func.config._name_or_path.split("/")[-1]
             else:
                 reward_func_name = reward_func.__name__
-            self._metrics[f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
+            self._metrics[mode][f"rewards/{reward_func_name}"].append(reward_per_func[i].item())
 
-        self._metrics["reward"].append(rewards.mean().item())
-        self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+        self._metrics[mode]["reward"].append(rewards.mean().item())
+        self._metrics[mode]["reward_std"].append(std_grouped_rewards.mean().item())
 
-        if (
-            self.log_completions
-            and self.state.global_step % self.args.logging_steps == 0
-            and "wandb" in self.args.report_to
-        ):
-            import pandas as pd
+        if self.log_completions and self.state.global_step % self.args.logging_steps == 0:
+            prompts_to_log = gather_object(prompts_text)
+            completions_to_log = gather_object(completions_text)
+            rewards_to_log = rewards.tolist()
 
-            # For logging
-            table = {
-                "step": [str(self.state.global_step)] * len(rewards),
-                "prompt": gather_object(prompts_text),
-                "completion": gather_object(completions_text),
-                "reward": rewards.tolist(),
-            }
-            df = pd.DataFrame(table)
+            if self.accelerator.is_main_process:
+                if is_rich_available():
+                    print_prompt_completions_sample(
+                        prompts_to_log,
+                        completions_to_log,
+                        rewards_to_log,
+                        self.state.global_step,
+                    )
+                if self.args.report_to and "wandb" in self.args.report_to and wandb.run is not None:
+                    import pandas as pd
 
-            if wandb.run is not None and self.accelerator.is_main_process:
-                wandb.log({"completions": wandb.Table(dataframe=df)})
+                    # For logging
+                    table = {
+                        "step": [str(self.state.global_step)] * len(rewards),
+                        "prompt": prompts_to_log,
+                        "completion": completions_to_log,
+                        "reward": rewards.tolist(),
+                    }
+                    df = pd.DataFrame(table)
+                    wandb.log({"completions": wandb.Table(dataframe=df)})
 
         return {
             "prompt_ids": prompt_ids,
             "prompt_mask": prompt_mask,
             "completion_ids": completion_ids,
             "completion_mask": completion_mask,
+            "old_per_token_logps": old_per_token_logps,
             "logits_full_q": logits_full_q,
             "advantages": advantages,
         }
 
-    def compute_kl(self, new_logprobs, ref_logprobs, logits_p=None, logits_q=None):
-        if logits_p is not None:
-            logp = torch.log_softmax(logits_p, dim=-1)
-            logq = torch.log_softmax(logits_q, dim=-1)
-
-            return torch.sum(torch.exp(logp) * (logp - logq), dim=-1)
-        return new_logprobs - ref_logprobs
-
+    @profiling_decorator
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
-
         # Compute the per-token log probabilities for the model
+
         prompt_ids, prompt_mask = inputs["prompt_ids"], inputs["prompt_mask"]
         completion_ids, completion_mask = inputs["completion_ids"], inputs["completion_mask"]
         input_ids = torch.cat([prompt_ids, completion_ids], dim=1)
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
         logits_to_keep = completion_ids.size(1)  # we only need to compute the logits for the completion tokens
 
-        # Get the per-token log probabilities for the model
-        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        
 
         # Compute the KL divergence between the model and the reference model
-        logits_full_p = self._get_per_token_logits(model, input_ids, attention_mask, logits_to_keep)
-        logits_full_q = inputs["logits_full_q"]  # (batch, comp_len, vocab)
+        if self.beta != 0.0:
+            # ref_per_token_logps = inputs["ref_per_token_logps"]
+            # per_token_kl = (
+            #     torch.exp(ref_per_token_logps - per_token_logps) - (ref_per_token_logps - per_token_logps) - 1
+            # )
+            logits_full_p = self._get_per_token_logits(model, input_ids, attention_mask, logits_to_keep)
+            logits_full_q = inputs["logits_full_q"]
+            logger.info(f"logits_full_p shape: {logits_full_p.shape}, logits_full_q shape: {logits_full_q.shape}")
 
-        per_step_kl = self.compute_kl(
-            new_logprobs=None,
-            ref_logprobs=None,
-            logits_p=logits_full_p,
-            logits_q=logits_full_q,
-        )  # shape (batch, comp_len)
+            per_step_kl = self.compute_kl(
+                new_logprobs=None,
+                ref_logprobs=None,
+                logits_p=logits_full_p,
+                logits_q=logits_full_q,
+            )  # shape (batch, comp_len)
 
-        # x - x.detach() allows for preserving gradients from x
-        advantages = inputs["advantages"]
+        per_token_logps = self._get_per_token_logps(model, input_ids, attention_mask, logits_to_keep)
+        logger.info(f"per_token_logsps shape: {per_token_logps.shape}")
 
-        per_token_loss = torch.exp(per_token_logps - per_token_logps.detach()) * advantages.unsqueeze(1)
-        self._metrics["surrogate_loss"].append(((-per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean().item())
-
-        per_token_loss = -(per_token_loss - self.beta * per_step_kl)
-        loss = ((per_token_loss * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
 
         # Log the metrics
-        completion_length = self.accelerator.gather_for_metrics(completion_mask.sum(1)).float().mean().item()
-        self._metrics["completion_length"].append(completion_length)
+        mode = "eval" if self.control.should_evaluate else "train"
 
-        mean_kl = ((per_step_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
-        self._metrics["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+        # Compute the loss
+        advantages = inputs["advantages"]
+        self._metrics[mode]["advantages"].append(advantages[0].item())
+        # When using num_iterations == 1, old_per_token_logps == per_token_logps, so we can skip it's computation (see
+        # _generate_and_score_completions) and use per_token_logps.detach() instead.
+        old_per_token_logps = inputs["old_per_token_logps"] if self.num_iterations > 1 else per_token_logps.detach()
+        coef_1 = torch.exp(per_token_logps - old_per_token_logps)
+        coef_2 = torch.clamp(coef_1, 1 - self.epsilon, 1 + self.epsilon)
+        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
+        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
+        self._metrics[mode]["surrogate_loss"].append(per_token_loss.mean().item())
 
+        if self.beta != 0.0:
+            per_token_loss = per_token_loss + self.beta * per_step_kl
+        loss = (per_token_loss * completion_mask).sum() / completion_mask.sum()
+
+        if self.beta != 0.0:
+            mean_kl = ((per_step_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)).mean()
+            self._metrics[mode]["kl"].append(self.accelerator.gather_for_metrics(mean_kl).mean().item())
+
+        is_clipped = (per_token_loss1 < per_token_loss2).float()
+        clip_ratio = (is_clipped * completion_mask).sum() / completion_mask.sum()
+        self._metrics[mode]["clip_ratio"].append(self.accelerator.gather_for_metrics(clip_ratio).mean().item())
         return loss
