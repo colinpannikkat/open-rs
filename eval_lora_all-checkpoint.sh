@@ -11,7 +11,7 @@ for checkpoint in $(seq 50 50 500); do
     LORA="./data/$LORA_MODEL/checkpoint-$checkpoint"
     echo "Evaluating LORA adapter: $LORA"
 
-    BASE_MODEL_ARGS="pretrained=$MODEL,lora_path=$LORA,max_lora_rank=64,dtype=bfloat16,max_model_length=32768,max_num_batched_tokens=32768,gpu_memory_utilization=0.8,generation_parameters={max_new_tokens:32768,temperature:0.6,top_p:0.95}"
+    MODEL_ARGS="pretrained=$MODEL,lora_path=$LORA,max_lora_rank=64,dtype=bfloat16,max_model_length=32768,max_num_batched_tokens=32768,gpu_memory_utilization=0.8,generation_parameters={max_new_tokens:32768,temperature:0.6,top_p:0.95}"
 
     OUTPUT_DIR="logs/evals/full-math-bench-tasks/$LORA"
 
@@ -25,7 +25,7 @@ for checkpoint in $(seq 50 50 500); do
     # Run evaluations for each task
     for task in $TASKS; do
         echo "Evaluating task: $task"
-        lighteval vllm "$BASE_MODEL_ARGS" "custom|$task|0|0" \
+        lighteval vllm "$MODEL_ARGS" "custom|$task|0|0" \
             --custom-tasks src/open_r1/evaluate.py \
             --use-chat-template \
             --output-dir "$OUTPUT_DIR"
