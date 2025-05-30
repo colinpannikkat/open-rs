@@ -181,3 +181,5 @@ sh/
 .triton
 wandb
 ~
+
+logs/evals/*
