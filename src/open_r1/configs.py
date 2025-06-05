@@ -54,6 +54,10 @@ class GRPOConfig(trl.GRPOConfig):
         default=False,
         metadata={"help": "The option on whether to use GRPOTrainerRBKL or the standard GRPOTrainer."},
     )
+    quantization: bool = field(
+        default=None,
+        metadata={"help": "The option to load a quantized model using bitsandbytes."}
+    )
 
 
 @dataclass

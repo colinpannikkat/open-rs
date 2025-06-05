@@ -340,6 +340,26 @@ def get_cosine_scaled_reward(
     return cosine_scaled_reward
 
 
+def get_cosine_len_reward(max_len: int = 1000):
+
+    def cosine_len_reward(completions, **kwargs):
+            
+        content = [completion[0]["content"] for completion in completions]
+        rewards = []
+
+        gen_len = len(content)
+
+        # Apply cosine scaling based on length
+        progress = gen_len / max_len
+        cosine = math.cos(progress * math.pi)
+
+        rewards.append(float(cosine)) # -1 to 1
+
+        return rewards
+    
+    return cosine_len_reward
+
+
 def get_repetition_penalty_reward(ngram_size: int, max_penalty: float):
     """
     Computes N-gram repetition penalty as described in Appendix C.2 of https://arxiv.org/abs/2502.03373.

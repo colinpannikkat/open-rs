@@ -22,7 +22,7 @@ import datasets
 import torch
 import transformers
 from datasets import load_dataset
-from transformers import set_seed
+from transformers import set_seed, BitsAndBytesConfig
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import is_peft_available
 
@@ -37,6 +37,7 @@ from open_r1.rewards import (
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
+    get_cosine_len_reward,
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
@@ -93,7 +94,7 @@ def get_peft_config(model_args: LoRAModelConfig) -> "Optional[PeftConfig]":
             "Make sure to run `pip install -U peft`."
         )
     
-    loftq_config = None
+    loftq_config = {}
     if model_args.lora_use_loftq:
         loftq_config = LoftQConfig(loftq_bits=4)
 
@@ -243,6 +244,7 @@ def main(script_args, training_args, model_args):
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
         "tag_count": tag_count_reward,
+        "cosine_len" : get_cosine_len_reward(script_args.cosine_max_len)
     }
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
@@ -272,6 +274,12 @@ def main(script_args, training_args, model_args):
         attn_implementation=model_args.attn_implementation,
         torch_dtype=torch_dtype,
         use_cache=False if training_args.gradient_checkpointing else True,
+        # quantization_config=BitsAndBytesConfig(
+        #     load_in_4bit=True,
+        #     bnb_4bit_quant_type="nf4",
+        #     bnb_4bit_use_double_quant=True,
+        #     bnb_4bit_compute_dtype=torch.bfloat16,
+        # )
     )
     training_args.model_init_kwargs = model_kwargs
 
